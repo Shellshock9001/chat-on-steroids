@@ -235,6 +235,18 @@ async function cancel(id: string, rawBody: unknown): Promise<ActionReply> {
   // would free its chat for a second copy. Nothing is reported as cancelled unless the row is
   // provably not sent afterwards.
   if (row.state === 'sent' || row.state === 'tool') return notCancellable(row, 'already handed to ChatGPT');
+  // A browser pickup timeout is a failed *attempt*, not necessarily a final
+  // cancellation: the delivery engine can requeue its immutable ID once.
+  // Explicit user Stop must commit a cancellation tombstone under the same
+  // serialized native ledger that performs that retry, before Smile unlocks.
+  if (row.state === 'failed' && deliveryProof(row) === 'not_sent') {
+    await cancelDesktopInput(id);
+    const after = await find(id);
+    if (!after || after.state !== 'cancelled' || deliveryProof(after) !== 'not_sent')
+      return notCancellable(after ?? row, 'the original input could not be conclusively withdrawn');
+    const done: ControlApiCancelResult = { input: projectInput(after), cancelled: true };
+    return { status: 200, body: done };
+  }
   if (row.state === 'cancelled' || row.state === 'failed') {
     const already: ControlApiCancelResult = { input: projectInput(row), cancelled: false };
     return { status: 200, body: already };

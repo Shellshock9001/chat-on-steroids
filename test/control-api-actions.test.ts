@@ -798,6 +798,25 @@ describe('starting a new chat', () => {
 });
 
 describe('cancelling', () => {
+  it('commits a cancellation tombstone for failed browser pickup before its same-ID retry', async () => {
+    const failed = row({
+      state: 'failed', conversationId: CHAT, transportIntent: 'browser',
+      error: 'Not sent: the browser did not pick up this message within 60 seconds.',
+      pickupFailedAt: Date.now() - 150_000, createdAt: Date.now() - 220_000
+    });
+    await seed([failed]);
+    expect(input.deliveryProof((await outbox())[0]!)).toBe('not_sent');
+    const result = await post('/v1/inputs/' + failed.id + '/cancel');
+    expect(result.status).toBe(200);
+    expect(result.body.cancelled).toBe(true);
+    expect(result.body.input).toMatchObject({ id: failed.id, state: 'cancelled',
+      delivery: 'not_sent', cancelledByUser: true });
+    expect(await input.retryUnclaimedInput(failed.id)).toBe(null);
+    expect((await outbox())[0]).toMatchObject({ state: 'cancelled', cancelledByUser: true });
+    const again = await post('/v1/inputs/' + failed.id + '/cancel');
+    expect(again.status).toBe(200);
+    expect(again.body.cancelled).toBe(false);
+  });
   it('withdraws a queued message and says it was not sent', async () => {
     const sent = await post('/v1/inputs', sendBody());
     const id = sent.body.input.id;
