@@ -1,6 +1,8 @@
 import { z } from 'zod';
+import { createHash } from 'node:crypto';
 import type {
   ControlApiAgents,
+  ControlApiAutomation,
   ControlApiEvent,
   ControlApiEvents,
   ControlApiInput,
@@ -278,6 +280,21 @@ async function sessionDetail(id: string, params: URLSearchParams): Promise<Contr
   });
 }
 
+export async function sessionAutomation(id: string, params = new URLSearchParams()): Promise<ControlApiAutomation> {
+  parseQuery(params, {});
+  const before = await readSession(id);
+  if (!before) throw new RequestError(404, 'session_not_found');
+  if (!before.conversationId) throw new RequestError(409, 'no_chat');
+  const controls = await sessionControlsFor(id);
+  const after = await readSession(id);
+  if (controls.conversationId !== before.conversationId || after?.conversationId !== before.conversationId) {
+    throw new RequestError(409, 'conversation_changed');
+  }
+  return { sessionId: id, conversationId: controls.conversationId,
+    automation: controls.automation, objectiveDigest: createHash('sha256').update(controls.objective, 'utf8').digest('hex'),
+    loopAfterTurn: controls.loopAfterTurn === true };
+}
+
 // ---------------------------------------------------------------- events
 
 export function projectEvent(event: SessionEvent): ControlApiEvent {
@@ -546,6 +563,8 @@ const SESSION_ROUTE = /^\/v1\/sessions\/([0-9a-z-]{8,64})(\/events)?$/;
  * that ignore case, so only the exact spelling is a route.
  */
 export async function serveRead(route: string, params: URLSearchParams): Promise<unknown | undefined> {
+  const automation = /^\/v1\/sessions\/([0-9a-z-]{8,64})\/automation$/.exec(route);
+  if (automation) return sessionAutomation(automation[1]!, params);
   if (route === '/v1/sessions') return sessionList(params);
   if (route === '/v1/inputs') return inputs(params);
   if (route === '/v1/agents') {

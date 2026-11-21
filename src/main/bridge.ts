@@ -2988,7 +2988,7 @@ function activateConversationGoalReply(id: string, active: boolean): Promise<boo
 
 /** Both UIs write the existing objective/switch/ticket authorities in the same order. */
 async function saveConversationObjective(id: string, text: string, named: 'goal' | 'loop' | null,
-  assertCurrent: () => Promise<void> = async () => undefined, from = 'the ChatGPT page') {
+  assertCurrent: () => Promise<void> = async () => undefined, from = 'the ChatGPT page', afterTurn?: boolean) {
   await assertCurrent();
   if (goalWorkerChat(id)) throw new Error('goal_worker_chat');
   if (text.trim() && await conversationWasSuperseded(id)) throw new Error('conversation_superseded');
@@ -2999,7 +2999,7 @@ async function saveConversationObjective(id: string, text: string, named: 'goal'
     const on = text.trim().length > 0;
     const which = on ? named : held.enabled ? held.mode : named;
     await assertCurrent();
-    try { chatSwitch = await setGoalSwitchNow(id, which, on, undefined, `${from} (objective saved)`); }
+    try { chatSwitch = await setGoalSwitchNow(id, which, on, afterTurn, `${from} (objective saved)`); }
     catch { throw new Error('goal_switch_not_durable'); }
   }
   await assertCurrent();
@@ -3014,11 +3014,11 @@ async function saveConversationObjective(id: string, text: string, named: 'goal'
   changed();
   return { objective, ...(chatSwitch ? { enabled: chatSwitch.enabled, own: true, mode: chatSwitch.mode } : {}) };
 }
-export async function setSessionObjective(sessionId: string, text: string, mode: 'goal' | 'loop'): Promise<SessionControlsView> {
+export async function setSessionObjective(sessionId: string, text: string, mode: 'goal' | 'loop', afterTurn?: boolean): Promise<SessionControlsView> {
   const id = await controlledConversation(sessionId);
   await saveConversationObjective(id, text, mode, async () => {
     if (await controlledConversation(sessionId) !== id) throw new Error('conversation_changed');
-  }, 'the app');
+  }, 'the app', afterTurn);
   return sessionControlsFor(sessionId);
 }
 /** Told after a chat's Goal or Loop was switched on or off, with who did it (Telegram's pause marker needs to know; #1990). */

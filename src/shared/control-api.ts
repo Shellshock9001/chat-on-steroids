@@ -14,6 +14,7 @@ export const CONTROL_API_ROUTES = [
   '/v1/status',
   '/v1/sessions',
   '/v1/sessions/{id}',
+  '/v1/sessions/{id}/automation',
   '/v1/sessions/{id}/events',
   '/v1/sessions/{id}/events/stream',
   '/v1/inputs',
@@ -30,7 +31,7 @@ export const CONTROL_API_ROUTES = [
  */
 export const CONTROL_API_ACTION_ROUTES = ['POST /v1/inputs', 'POST /v1/inputs/{id}/cancel',
   'POST /v1/workers/{ownerId}/spawn', 'POST /v1/workers/{ownerId}/message', 'POST /v1/workers/{ownerId}/ack',
-  'POST /v1/sessions/{id}/stop'] as const;
+  'POST /v1/sessions/{id}/stop', 'POST /v1/sessions/{id}/automation'] as const;
 
 /** Written to `userData/control-api/endpoint.json` while the listener is up. */
 export interface ControlApiEndpoint {
@@ -217,6 +218,16 @@ export interface ControlApiSessionDetail {
    * session moved to another chat while it was being read.
    */
   live?: ControlApiLive | null;
+}
+
+/** Exact, durable native Goal/Loop state for one recorded conversation. */
+export interface ControlApiAutomation {
+  sessionId: string;
+  conversationId: string;
+  automation: 'off' | 'goal' | 'loop';
+  /** Exact SHA-256 of the saved UTF-8 objective. Its text remains with the native owner. */
+  objectiveDigest: string;
+  loopAfterTurn: boolean;
 }
 
 export type ControlApiEvent = {

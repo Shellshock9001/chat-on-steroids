@@ -391,8 +391,9 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse, token
   }
   // Charged only after authentication, so another local process cannot spend the budget.
   if (rateLimited()) return reply(res, 429, { error: 'rate_limited' });
+  const automationRead = /^\/v1\/sessions\/[0-9a-z-]{8,64}\/automation$/.test(route);
   if (req.method !== 'GET') {
-    const allow = route === '/v1/inputs' ? 'GET, POST' : isActionPath(route) ? 'POST' : 'GET';
+    const allow = route === '/v1/inputs' || automationRead ? 'GET, POST' : isActionPath(route) ? 'POST' : 'GET';
     return reply(res, 405, { error: 'method_not_allowed' }, { allow });
   }
   if (Number(req.headers['content-length'] ?? 0) > 0 || req.headers['transfer-encoding'] !== undefined) {
@@ -400,7 +401,9 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse, token
     return reply(res, 413, { error: 'body_not_allowed' });
   }
   // A cancel path answers to POST only; a GET there is a wrong method, not a missing page.
-  if (isActionPath(route) && route !== '/v1/inputs') return reply(res, 405, { error: 'method_not_allowed' }, { allow: 'POST' });
+  if (isActionPath(route) && route !== '/v1/inputs' && !automationRead) {
+    return reply(res, 405, { error: 'method_not_allowed' }, { allow: 'POST' });
+  }
 
   const streamed = eventStreamSession(route);
   if (streamed) {

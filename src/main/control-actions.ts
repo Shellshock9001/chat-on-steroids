@@ -1,14 +1,15 @@
 import { z } from 'zod';
+import { createHash } from 'node:crypto';
 import { serveWorkerAction } from './control-workers.js';
 import { resolveChatModel } from '../shared/chat-models.js';
 import type { ControlApiCancelResult, ControlApiSendResult, ControlApiStopResult } from '../shared/control-api.js';
 import { REASONING_EFFORTS } from '../shared/session.js';
 import type { ReasoningEffort } from '../shared/session.js';
 import { getChatModels } from './chat-models.js';
-import { stopSessionTurn } from './bridge.js';
+import { setSessionAutomation, setSessionObjective, stopSessionTurn } from './bridge.js';
 import type { SessionControlsView } from './bridge.js';
 import { getConfig } from './config.js';
-import { projectInput, projectLive, RequestError } from './control-reads.js';
+import { projectInput, projectLive, RequestError, sessionAutomation } from './control-reads.js';
 import { logInfo } from './logger.js';
 import { deliveryProof, listInputs, sessionInputPolicy } from './session/input.js';
 import type { InputArgs, InputEntry } from './session/input.js';
@@ -53,6 +54,11 @@ const sendBody = z
     // The project a new chat starts in. An existing chat keeps the one it has.
     projectId: lowerUuid.optional(),
     text: z.string().max(MAX_TEXT).refine((value) => value.trim().length > 0, 'text is empty'),
+    // The outbox already applies these settings at the native send boundary. Keeping them
+    // on the immutable input makes a fresh chat and a continued chat behave identically.
+    automation: z.enum(['off', 'goal', 'loop']).optional(),
+    objective: z.string().trim().max(16000).optional(),
+    loopAfterTurn: z.boolean().optional(),
     // Consent to a send that would stop the answer ChatGPT is writing right now.
     interrupt: z.boolean().optional(),
     // A model and one of its thinking levels from GET /v1/models, always together, as the composer sends them.
@@ -60,6 +66,10 @@ const sendBody = z
     reasoningEffort: z.enum(REASONING_EFFORTS).optional()
   })
   .strict()
+  .refine((body) => body.automation !== undefined || (body.objective === undefined && body.loopAfterTurn === undefined),
+    { path: ['automation'], message: 'automation is required with objective or loopAfterTurn' })
+  .refine((body) => body.automation !== 'off' || body.objective === undefined,
+    { path: ['objective'], message: 'off does not set an objective' })
   .refine((body) => body.sessionId === undefined || body.projectId === undefined, { path: ['projectId'], message: 'a project belongs to a new chat' })
   .refine((body) => (body.model === undefined) === (body.reasoningEffort === undefined), { path: ['reasoningEffort'], message: 'model and reasoningEffort go together' });
 
@@ -70,11 +80,19 @@ const stopBody = z.object({ turnId: z.string().min(1).max(256) }).strict();
 
 const CANCEL_ROUTE = /^\/v1\/inputs\/([0-9a-f-]{36})\/cancel$/;
 const STOP_ROUTE = /^\/v1\/sessions\/([0-9a-z-]{8,64})\/stop$/;
+const AUTOMATION_ROUTE = /^\/v1\/sessions\/([0-9a-z-]{8,64})\/automation$/;
+const automationBody = z.object({
+  conversationId: z.string().regex(/^[0-9a-z-]{8,256}$/i),
+  automation: z.enum(['off', 'goal', 'loop']),
+  objective: z.string().trim().max(16000).optional(),
+  loopAfterTurn: z.boolean().optional()
+}).strict().refine((body) => body.automation !== 'off' || body.objective === undefined || body.objective === '',
+  { path: ['objective'], message: 'off can only clear an objective' });
 
 /** Every path an action can arrive on, whatever the id, so one gate can refuse them all alike. */
 export function isActionPath(route: string): boolean {
   return route === '/v1/inputs' || /^\/v1\/inputs\/[^/]+\/cancel$/.test(route) || /^\/v1\/workers\/[^/]+\/(spawn|message|ack)$/.test(route) ||
-    /^\/v1\/sessions\/[^/]+\/stop$/.test(route);
+    /^\/v1\/sessions\/[^/]+\/(stop|automation)$/.test(route);
 }
 
 export interface ActionReply {
@@ -142,7 +160,9 @@ async function send(rawBody: unknown): Promise<ActionReply> {
   if (existing) {
     // A new chat's first message is filed under its own id.
     if (existing.purpose === 'decision' || existing.sessionId !== (body.sessionId ?? body.id) || existing.text !== text ||
-        existing.model !== selection.model || existing.reasoningEffort !== selection.reasoningEffort) {
+        existing.model !== selection.model || existing.reasoningEffort !== selection.reasoningEffort ||
+        existing.automation !== body.automation || existing.objective !== body.objective ||
+        existing.loopAfterTurn !== body.loopAfterTurn) {
       throw new RequestError(409, 'id_conflict', 'this id belongs to a different message');
     }
     const replay: ControlApiSendResult = { input: projectInput(existing), replayed: true };
@@ -171,6 +191,9 @@ async function send(rawBody: unknown): Promise<ActionReply> {
     sessionId: body.sessionId ?? null,
     ...(body.projectId !== undefined ? { projectId: body.projectId } : {}),
     text,
+    ...(body.automation !== undefined ? { automation: body.automation } : {}),
+    ...(body.objective !== undefined ? { objective: body.objective } : {}),
+    ...(body.loopAfterTurn !== undefined ? { loopAfterTurn: body.loopAfterTurn } : {}),
     mode: 'auto',
     dueAt: Date.now(),
     ...selection,
@@ -261,6 +284,38 @@ async function stop(sessionId: string, rawBody: unknown): Promise<ActionReply> {
   return { status: 202, body: reply };
 }
 
+async function setAutomation(sessionId: string, rawBody: unknown): Promise<ActionReply> {
+  const body = parse(automationBody, rawBody);
+  const session = await readSession(sessionId);
+  if (!session) throw new RequestError(404, 'session_not_found');
+  await controllable(sessionId);
+  if (!session.conversationId || session.conversationId !== body.conversationId) {
+    throw new RequestError(409, 'conversation_changed');
+  }
+  if (!actionsAllowed()) throw new RequestError(403, 'actions_disabled');
+  try {
+    if (body.objective !== undefined) {
+      await setSessionObjective(sessionId, body.objective, body.automation === 'off' ? 'goal' : body.automation, body.loopAfterTurn);
+    } else {
+      await setSessionAutomation(sessionId, body.automation, body.loopAfterTurn, 'the control API');
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : '';
+    if (message === 'conversation_changed' || message === 'conversation_superseded') throw new RequestError(409, 'conversation_changed');
+    if (message === 'chat_blocked' || message === 'goal_worker_chat' || message === 'worker_goal_disabled') {
+      throw new RequestError(409, 'chat_blocked');
+    }
+    throw error;
+  }
+  const actual = await sessionAutomation(sessionId);
+  if (actual.conversationId !== body.conversationId || actual.automation !== body.automation ||
+      (body.objective !== undefined && actual.objectiveDigest !== createHash('sha256').update(body.objective, 'utf8').digest('hex')) ||
+      (body.loopAfterTurn !== undefined && actual.loopAfterTurn !== body.loopAfterTurn)) {
+    throw new RequestError(409, 'automation_unconfirmed');
+  }
+  return { status: 200, body: actual };
+}
+
 /** Undefined when the method and path are not an action. */
 export async function serveAction(method: string, route: string, body: unknown): Promise<ActionReply | undefined> {
   if (method !== 'POST') return undefined;
@@ -273,5 +328,7 @@ export async function serveAction(method: string, route: string, body: unknown):
   if (match) return cancel(match[1]!, body);
   const stopMatch = STOP_ROUTE.exec(route);
   if (stopMatch) return stop(stopMatch[1]!, body);
+  const automationMatch = AUTOMATION_ROUTE.exec(route);
+  if (automationMatch) return setAutomation(automationMatch[1]!, body);
   return undefined;
 }

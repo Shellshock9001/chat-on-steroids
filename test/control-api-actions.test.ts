@@ -5,6 +5,7 @@
  */
 
 import { randomBytes, randomUUID } from 'node:crypto';
+import { createHash } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
@@ -255,7 +256,7 @@ describe('with actions switched off', () => {
     expect(refused.status).toBe(403);
     expect(refused.continued).toBe(false);
     expect((await call('GET', '/v1/inputs')).status).toBe(200);
-    expect((await call('GET', '/v1/health')).body.actions).toEqual({ enabled: false, routes: ['POST /v1/inputs', 'POST /v1/inputs/{id}/cancel', 'POST /v1/workers/{ownerId}/spawn', 'POST /v1/workers/{ownerId}/message', 'POST /v1/workers/{ownerId}/ack', 'POST /v1/sessions/{id}/stop'] });
+      expect((await call('GET', '/v1/health')).body.actions).toEqual({ enabled: false, routes: ['POST /v1/inputs', 'POST /v1/inputs/{id}/cancel', 'POST /v1/workers/{ownerId}/spawn', 'POST /v1/workers/{ownerId}/message', 'POST /v1/workers/{ownerId}/ack', 'POST /v1/sessions/{id}/stop', 'POST /v1/sessions/{id}/automation'] });
   });
 
   it('follows the switch on the next request without restarting the listener', async () => {
@@ -1122,6 +1123,52 @@ describe('choosing a model', () => {
     const sent = await post('/v1/inputs', sendBody());
     expect(sent.status).toBe(202);
     expect(sent.body.input).toMatchObject({ model: null, reasoningEffort: null });
+  });
+});
+
+describe('Goal and Loop through the native control API', () => {
+  it('advertises native state control and preserves Goal settings on an immutable input', async () => {
+    const health = (await call('GET', '/v1/health')).body;
+    expect(health.routes).toContain('/v1/sessions/{id}/automation');
+    expect(health.actions.routes).toContain('POST /v1/sessions/{id}/automation');
+    const objective = 'Verify the full task before finishing.';
+    const request = sendBody({ automation: 'goal', objective, loopAfterTurn: true });
+    const response = await post('/v1/inputs', request);
+    expect(response.status).toBe(202);
+    expect((await outbox())[0]).toMatchObject({ id: request.id, automation: 'goal', objective, loopAfterTurn: true });
+    expect((await post('/v1/inputs', request)).body.replayed).toBe(true);
+    expect((await post('/v1/inputs', { ...request, objective: 'Different objective' })).body.error).toBe('id_conflict');
+    expect((await post('/v1/inputs', sendBody({ objective: 'orphan' }))).body.error).toBe('invalid_body');
+    expect((await post('/v1/inputs', sendBody({ automation: 'off', objective: 'bad' }))).body.error).toBe('invalid_body');
+  });
+
+  it('reads back the same durable Goal and Loop state the app owns, and refuses stale conversation identity', async () => {
+    const id = await makeSession('Automation control', 'chat-automation-session');
+    const url = '/v1/sessions/' + id + '/automation';
+    const saved = await post(url, { conversationId: 'chat-automation-session', automation: 'goal', objective: 'Finish after verification.' });
+    expect(saved.status).toBe(200);
+    expect(saved.body).toMatchObject({ sessionId: id, conversationId: 'chat-automation-session', automation: 'goal',
+      objectiveDigest: createHash('sha256').update('Finish after verification.').digest('hex') });
+    expect(saved.body).not.toHaveProperty('objective');
+    expect((await call('GET', url)).body).toEqual(saved.body);
+
+    const loop = await post(url, { conversationId: 'chat-automation-session', automation: 'loop', objective: 'Continue improving within the brief.', loopAfterTurn: true });
+    expect(loop.status).toBe(200);
+    expect((await call('GET', url)).body).toMatchObject({ automation: 'loop',
+      objectiveDigest: createHash('sha256').update('Continue improving within the brief.').digest('hex'), loopAfterTurn: true });
+    const stale = await post(url, { conversationId: 'another-chat-id', automation: 'goal' });
+    expect(stale.status).toBe(409);
+    expect(stale.body.error).toBe('conversation_changed');
+    expect((await call('GET', url)).body.automation).toBe('loop');
+    expect((await post(url, { conversationId: 'chat-automation-session', automation: 'off', objective: '' })).body).toMatchObject({
+      automation: 'off', objectiveDigest: createHash('sha256').update('').digest('hex') });
+  });
+
+  it('rejects mutations when local actions are disabled', async () => {
+    gate.actions = false;
+    const res = await post('/v1/sessions/' + chatSession + '/automation', { conversationId: CHAT, automation: 'goal' });
+    expect(res.status).toBe(403);
+    expect(res.body.error).toBe('actions_disabled');
   });
 });
 
