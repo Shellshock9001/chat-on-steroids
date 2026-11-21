@@ -243,6 +243,7 @@ const TOOL_INPUT_TEXT_BYTES = 128000;
 const UNCERTAIN_SEND_MS = 15 * 60_000;
 const UNCLAIMED_PICKUP_RETRY_MIN_MS = 2 * 60_000;
 const UNCLAIMED_PICKUP_RETRY_MAX_AGE_MS = 30 * 60_000;
+const UNCLAIMED_PICKUP_FAILED = 'Not sent: the browser did not pick up this message within 60 seconds.';
 /**
  * The same bound for the sends the one above leaves in custody: an automatic Continue, a new
  * chat's first message and a combined delivery. Their own paths normally settle them in seconds
@@ -466,6 +467,17 @@ export function deliveryProof(row: Readonly<InputEntry>): DeliveryProof {
   if (row.state === 'failed' && row.error === NOT_TAKEN_FAILED) return 'not_sent';
   if (terminal(row)) return neverAuthorized(row) ? 'not_sent' : 'unconfirmed';
   return row.state === 'queued' || (row.state === 'browser' && neverAuthorized(row)) ? 'pending' : 'unconfirmed';
+}
+/** Definitive no-Send proof, including the native retry lifecycle.
+ * The first failed browser pickup is *not* settled: the same immutable ID may
+ * be offered once more. Once that retry has been consumed, or the failure is
+ * not one eligible for retry, this row cannot silently become a late Send.
+ */
+export function settledNotSent(row: Readonly<InputEntry>): boolean {
+  if (deliveryProof(row) !== 'not_sent') return false;
+  if (row.state === 'cancelled') return true;
+  if (row.state !== 'failed') return false;
+  return row.error !== UNCLAIMED_PICKUP_FAILED || (row.pickupRetryCount ?? 0) >= 1;
 }
 const preparable = (row: InputEntry): boolean => row.state === 'queued' ||
   (row.state === 'browser' && row.requiresAuthorization === true && row.sendAuthorizedAt === undefined);
@@ -769,7 +781,7 @@ async function expireQueued(current: InputEntry[]): Promise<InputEntry[]> {
       const eligibleMs = (row.scheduledPickupMs ?? 0) + (eligible ? interval : 0);
       if (eligible && eligibleMs >= 60_000) return { ...row, state: 'failed', pickupFailedAt: now,
         scheduledPickupMs: undefined, scheduledPickupSince: undefined,
-        error: 'Not sent: the browser did not pick up this message within 60 seconds.' };
+        error: UNCLAIMED_PICKUP_FAILED };
       if (!eligible) {
         // A hold may have started between polls. Discard the uncheckpointed interval
         // rather than count any time that might have belonged to the hold.
@@ -794,7 +806,7 @@ async function expireQueued(current: InputEntry[]): Promise<InputEntry[]> {
         // Nor is time a page held it until its own turn ended: that page has it (2026-11-03).
         // Nor time "Chats working at once" held it back: the app never offered it then (#1694, CodeRabbit on #2051).
         Date.now() - Math.max(row.createdAt, row.dueAt, row.sendCheck?.nextAt ?? 0, await heldUntil(row), row.slotHold?.at ?? 0) >= 60_000)
-      return { ...row, state: 'failed', pickupFailedAt: Date.now(), error: 'Not sent: the browser did not pick up this message within 60 seconds.' };
+      return { ...row, state: 'failed', pickupFailedAt: Date.now(), error: UNCLAIMED_PICKUP_FAILED };
     // Preparation can expire before Send. Once authorized, this exact claim owns
     // the uncertain outcome until receipt or explicit cancellation, regardless of
     // how long ChatGPT takes to assign its durable conversation identity.
@@ -882,7 +894,7 @@ export function retryUnclaimedInput(id: string): Promise<InputEntry | null> {
     const current = await load();
     const row = current.find(entry => entry.id === id);
     const now = Date.now();
-    if (!row || row.state !== 'failed' || row.error !== 'Not sent: the browser did not pick up this message within 60 seconds.' ||
+    if (!row || row.state !== 'failed' || row.error !== UNCLAIMED_PICKUP_FAILED ||
         !Number.isFinite(row.pickupFailedAt) || (row.pickupRetryCount !== undefined && row.pickupRetryCount !== 0) ||
         now - row.pickupFailedAt! < UNCLAIMED_PICKUP_RETRY_MIN_MS || now - row.pickupFailedAt! > UNCLAIMED_PICKUP_RETRY_MAX_AGE_MS ||
         now < row.createdAt || now - row.createdAt > UNCLAIMED_PICKUP_RETRY_MAX_AGE_MS || row.sendAuthorizedAt !== undefined || row.deliveredAt !== undefined ||

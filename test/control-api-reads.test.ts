@@ -653,7 +653,7 @@ describe('input outbox', () => {
     expect(Object.keys(row).sort()).toEqual([
       'attachments', 'automatic', 'cancelledByUser', 'conversationId', 'createdAt', 'deliveredAt', 'deliveredSessionId', 'delivery',
       'dueAt', 'error', 'id', 'images', 'messageId', 'mode', 'model', 'offeredAt', 'purpose', 'queueOrder', 'reasoningEffort',
-      'requiresAuthorization', 'sendAuthorizedAt', 'sessionId', 'state', 'text', 'transportIntent'
+      'requiresAuthorization', 'sendAuthorizedAt', 'sessionId', 'settledNotSent', 'state', 'text', 'transportIntent'
     ]);
     expect(row.delivery).toBe('pending');
     const direct = await call(`/v1/inputs/${queued.id}`);
@@ -708,6 +708,20 @@ describe('input outbox', () => {
 describe('delivery proof', () => {
   const row = (over: object) => ({ id: randomUUID(), sessionId: 'abc12345', text: 'hi', mode: 'auto', dueAt: 1, model: null,
     reasoningEffort: null, state: 'queued', owner: null, createdAt: 1, conversationId: null, ...over }) as never;
+
+  it('distinguishes a failed pickup eligible for its same-ID retry from settled no-Send', () => {
+    const pickup='Not sent: the browser did not pick up this message within 60 seconds.';
+    const first=reads.projectInput(row({state:'failed',error:pickup,pickupRetryCount:0}));
+    const exhausted=reads.projectInput(row({state:'failed',error:pickup,pickupRetryCount:1}));
+    const cancelled=reads.projectInput(row({state:'cancelled',cancelledByUser:true}));
+    const provenFailure=reads.projectInput(row({state:'failed',error:'Not sent: ChatGPT did not accept the message.'}));
+    const ambiguous=reads.projectInput(row({state:'failed',sendAuthorizedAt:2,error:'Delivery uncertain'}));
+    expect(first).toMatchObject({delivery:'not_sent',settledNotSent:false});
+    expect(exhausted).toMatchObject({delivery:'not_sent',settledNotSent:true});
+    expect(cancelled).toMatchObject({delivery:'not_sent',settledNotSent:true});
+    expect(provenFailure).toMatchObject({delivery:'not_sent',settledNotSent:true});
+    expect(ambiguous).toMatchObject({delivery:'unconfirmed',settledNotSent:false});
+  });
 
   it.each([
     ['queued', { state: 'queued' }, 'pending'],

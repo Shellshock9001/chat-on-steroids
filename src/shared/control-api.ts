@@ -317,6 +317,8 @@ export interface ControlApiInput {
    * `pending`: not yet handed out.
    */
   delivery: 'sent' | 'not_sent' | 'unconfirmed' | 'pending';
+  /** True only when no native retry or Send can follow this no-delivery row. */
+  settledNotSent: boolean;
   mode: string;
   transportIntent: string | null;
   /** Filed by the app itself, such as a recovery pickup, rather than sent by a person or agent. */
